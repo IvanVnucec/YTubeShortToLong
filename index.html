@@ -1,68 +1,145 @@
-<html>
-
+<!DOCTYPE html>
+<html lang="en">
 <head>
+  <meta charset="UTF-8">
+  <title>Universal Video Re-encoder (client-side)</title>
+  <style>
+    body {font-family: sans-serif; margin: 2rem;}
+    #download-btn {display:none; margin-top:.5rem;}
+    video {max-width:100%;}
+  </style>
 </head>
-
 <body>
-    <h3>Upload a video to transcode to mp4 (x264) and play!</h3>
-    <video id="output-video" controls></video><br />
-    <input type="file" id="uploader">
-    <p id="message"></p>
-    <script type="module">
-        import { FFmpeg } from "/assets/ffmpeg/package/dist/esm/index.js";
-        import { fetchFile } from "/assets/util/package/dist/esm/index.js";
-        let ffmpeg = null;
+  <h3>Upload any video → re-encode to the same container (1920×1080) → play & download</h3>
 
-        const transcode = async ({ target: { files } }) => {
-            const message = document.getElementById('message');
-            if (ffmpeg === null) {
-                ffmpeg = new FFmpeg();
-                ffmpeg.on("log", ({ message }) => {
-                    console.log(message);
-                })
-                ffmpeg.on("progress", ({ progress }) => {
-                    message.innerHTML = `${progress * 100} %`;
-                });
-                await ffmpeg.load({
-                    coreURL: "/assets/core-mt/package/dist/esm/ffmpeg-core.js",
-                });
-            }
-            const { name } = files[0];
-            await ffmpeg.writeFile(name, await fetchFile(files[0]));
-            message.innerHTML = 'Start transcoding';
+  <video id="output-video" controls></video><br/>
 
-            const targetWidth = 1920;
-            const targetHeight = 1080;
+  <button id="download-btn">Download Re-encoded Video</button><br/>
 
-            const filter = [
-                // 1. Scale down while preserving aspect ratio, fit inside 1920x1080
-                `scale=w='if(gte(iw,ih),min(${targetWidth},iw),-1)':h='if(gte(iw,ih),-1,min(${targetHeight},ih))'`,
-                // 2. Force even width/height (required by libx264)
-                'scale=w=trunc(iw/2)*2:h=trunc(ih/2)*2',
-                // 3. Pad to exact size with centered black bars
-                `pad=width=${targetWidth}:height=${targetHeight}:x=(${targetWidth}-iw)/2:y=(${targetHeight}-ih)/2:color=black`
-            ].join(',');
+  <input type="file" id="uploader" accept="video/*">
+  <p id="message"></p>
 
-            await ffmpeg.exec([
-                '-i', name,
-                '-vf', filter,
-                '-c:v', 'libx264',
-                '-preset', 'medium',
-                '-crf', '23',
-                '-movflags', '+faststart',
-                '-c:a', 'aac',
-                '-b:a', '128k',
-                'output.mp4'
-            ]);
-            message.innerHTML = 'Complete transcoding';
-            const data = await ffmpeg.readFile('output.mp4');
+  <script type="module">
+    import { FFmpeg } from "/assets/ffmpeg/package/dist/esm/index.js";
+    import { fetchFile } from "/assets/util/package/dist/esm/index.js";
 
-            const video = document.getElementById('output-video');
-            video.src = URL.createObjectURL(new Blob([data.buffer], { type: 'video/mp4' }));
-        }
-        const elm = document.getElementById('uploader');
-        elm.addEventListener('change', transcode);
-    </script>
+    let ffmpeg = null;
+    let transcodedBlob = null;
+
+    const $msg      = document.getElementById('message');
+    const $video    = document.getElementById('output-video');
+    const $download = document.getElementById('download-btn');
+    const $uploader = document.getElementById('uploader');
+
+    // ---------- Detect container from file extension ----------
+    function getContainer(fileName) {
+      const ext = fileName.split('.').pop().toLowerCase();
+      // Normalise a few common synonyms
+      const map = { mkv: 'mp4', avi: 'mp4', mov: 'mp4' };
+      return map[ext] || ext;               // fall back to the original extension
+    }
+
+    // ---------- Build FFmpeg arguments for the detected container ----------
+    function buildArgs(inputName, container) {
+      const outFile = `output.${container}`;
+
+      // 1. Scale (preserve AR) → 2. Even dimensions → 3. Pad to 1920×1080
+      const filter = [
+        `scale=w='if(gte(iw,ih),min(1920,iw),-1)':h='if(gte(iw,ih),-1,min(1080,ih))'`,
+        'scale=w=trunc(iw/2)*2:h=trunc(ih/2)*2',
+        `pad=width=1920:height=1080:x=(1920-iw)/2:y=(1080-ih)/2:color=black`
+      ].join(',');
+
+      const args = ['-i', inputName, '-vf', filter];
+
+      // ---- Codec selection per container ----
+      switch (container) {
+        case 'mp4':
+          args.push(
+            '-c:v', 'libx264', '-preset', 'medium', '-crf', '23',
+            '-movflags', '+faststart',
+            '-c:a', 'aac', '-b:a', '128k'
+          );
+          break;
+
+        case 'webm':
+          args.push(
+            '-c:v', 'libvpx-vp9', '-b:v', '2M',
+            '-c:a', 'libopus', '-b:a', '128k'
+          );
+          break;
+
+        case 'ogg':
+          args.push(
+            '-c:v', 'libtheora', '-q:v', '7',
+            '-c:a', 'libvorbis', '-b:a', '128k'
+          );
+          break;
+
+        default:                     // fallback – try H.264 in MP4 container
+          args.push(
+            '-c:v', 'libx264', '-preset', 'medium', '-crf', '23',
+            '-c:a', 'aac', '-b:a', '128k'
+          );
+          break;
+      }
+
+      args.push(outFile);
+      return { args, outFile };
+    }
+
+    // ---------- Main conversion ----------
+    const transcode = async (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+
+      $msg.textContent = '';
+      $download.style.display = 'none';
+      transcodedBlob = null;
+
+      // ---- Initialise FFmpeg (once) ----
+      if (!ffmpeg) {
+        ffmpeg = new FFmpeg();
+        ffmpeg.on('log', ({ message }) => console.log(message));
+        ffmpeg.on('progress', ({ progress }) => {
+          $msg.textContent = `${(progress * 100).toFixed(0)} %`;
+        });
+        await ffmpeg.load({
+          coreURL: "/assets/core-mt/package/dist/esm/ffmpeg-core.js",
+        });
+      }
+
+      const inputName = file.name;
+      await ffmpeg.writeFile(inputName, await fetchFile(file));
+      $msg.textContent = 'Start re-encoding…';
+
+      const container = getContainer(inputName);
+      const { args, outFile } = buildArgs(inputName, container);
+
+      await ffmpeg.exec(args);
+      $msg.textContent = 'Done!';
+
+      const data = await ffmpeg.readFile(outFile);
+      const mime = container === 'ogg' ? 'video/ogg' :
+                   container === 'webm' ? 'video/webm' : 'video/mp4';
+      transcodedBlob = new Blob([data.buffer], { type: mime });
+
+      // ---- Playback ----
+      $video.src = URL.createObjectURL(transcodedBlob);
+
+      // ---- Download button ----
+      $download.style.display = 'inline-block';
+      $download.onclick = () => {
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(transcodedBlob);
+        a.download = inputName.replace(/\.[^/.]+$/, '') + '_reencoded.' + container;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+      };
+    };
+
+    $uploader.addEventListener('change', transcode);
+  </script>
 </body>
-
 </html>
