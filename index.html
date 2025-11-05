@@ -30,7 +30,30 @@
             const { name } = files[0];
             await ffmpeg.writeFile(name, await fetchFile(files[0]));
             message.innerHTML = 'Start transcoding';
-            await ffmpeg.exec(['-i', name, 'output.mp4']);
+
+            const targetWidth = 1920;
+            const targetHeight = 1080;
+
+            const filter = [
+                // 1. Scale down while preserving aspect ratio, fit inside 1920x1080
+                `scale=w='if(gte(iw,ih),min(${targetWidth},iw),-1)':h='if(gte(iw,ih),-1,min(${targetHeight},ih))'`,
+                // 2. Force even width/height (required by libx264)
+                'scale=w=trunc(iw/2)*2:h=trunc(ih/2)*2',
+                // 3. Pad to exact size with centered black bars
+                `pad=width=${targetWidth}:height=${targetHeight}:x=(${targetWidth}-iw)/2:y=(${targetHeight}-ih)/2:color=black`
+            ].join(',');
+
+            await ffmpeg.exec([
+                '-i', name,
+                '-vf', filter,
+                '-c:v', 'libx264',
+                '-preset', 'medium',
+                '-crf', '23',
+                '-movflags', '+faststart',
+                '-c:a', 'aac',
+                '-b:a', '128k',
+                'output.mp4'
+            ]);
             message.innerHTML = 'Complete transcoding';
             const data = await ffmpeg.readFile('output.mp4');
 
